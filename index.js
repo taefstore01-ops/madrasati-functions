@@ -1,100 +1,825 @@
-const express = require('express');
-const cors = require('cors');
-const admin = require('firebase-admin');
-const Anthropic = require('@anthropic-ai/sdk');
-const pdfParse = require('pdf-parse');
-const mammoth = require('mammoth');
+    res.status(404).json({ error: 'This exam is not available.' });
+    return;
+  }
+  const exam = examSnap.data();
 
-admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  if (exam.restrictedStudentUid && exam.restrictedStudentUid !== uid) {
+    res.status(403).json({
+      error: 'This exam is restricted to a specific student.',
+      restricted: true,
+    });
+    return;
+  }
+
+  const now = Date.now();
+  if (exam.scheduledStartAt && now < exam.scheduledStartAt) {
+    res.status(403).json({
+      error: 'This exam has not started yet.',
+      notStarted: true,
+      scheduledStartAt: exam.scheduledStartAt,
+    });
+    return;
+  }
+  if (exam.scheduledEndAt && now > exam.scheduledEndAt) {
+    res.status(403).json({
+      error: 'This exam has ended.',
+      ended: true,
+    });
+    return;
+  }
+
+  const attemptsAllowed = (exam.settings && exam.settings.attemptsAllowed) || 1;
+  const priorAttempts = await examRef
+    .collection('attempts')
+    .where('studentUid', '==', uid)
+    .get();
+  if (priorAttempts.size >= attemptsAllowed) {
+    res.status(403).json({ error: 'You have no attempts left for this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  const questions = questionsSnap.docs.map((d) => {
+    const q = d.data();
+    return {
+      id: d.id,
+      type: q.type,
+      text: q.text,
+      options: q.options || null,
+      optionImageUrls: q.optionImageUrls || null,
+      points: q.points || 1,
+    };
+  });
+
+  // Shuffle question order per attempt so students sitting together see a
+  // different sequence — grading is keyed by question id, unaffected by order.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  let watermarkText = displayName;
+  const userSnap = await db.collection('users').doc(uid).get();
+  if (userSnap.exists && userSnap.data().nationalId) {
+    watermarkText = `${displayName} - ${userSnap.data().nationalId}`;
+  }
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    watermarkText,
+    questions,
+  });
 });
 
-const db = admin.firestore();
-const bucket = admin.storage().bucket();
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
 
-const MAX_CHARS = 40000;
-const DIFFICULTIES = ['beginner', 'intermediate', 'hard'];
-
-async function extractText(buffer, mimeType) {
-  let raw;
-  if (mimeType === 'application/pdf') {
-    raw = (await pdfParse(buffer)).text;
-  } else if (
-    mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-    mimeType === 'application/msword'
-  ) {
-    raw = (await mammoth.extractRawText({ buffer })).value;
-  } else {
-    throw new Error(`Unsupported file type: ${mimeType}`);
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  const tabSwitchCount = Math.max(0, Math.min(999, Number(req.body && req.body.tabSwitchCount) || 0));
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
   }
-  const trimmed = raw.trim();
-  return trimmed.length <= MAX_CHARS ? trimmed : trimmed.slice(0, MAX_CHARS);
-}
 
-function buildPrompt({ text, difficulty, trueFalseCount, multipleChoiceCount, language }) {
-  const languageName = language === 'ar' ? 'Arabic' : 'English';
-  return `You are an expert teacher creating an exam from the curriculum text below.
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
 
-Curriculum text:
-"""
-${text}
-"""
-
-Generate exactly ${trueFalseCount} true/false questions and ${multipleChoiceCount} multiple-choice questions (3-4 options each) at "${difficulty}" difficulty.
-Write all question text, options, and explanations in ${languageName}.
-Base every question strictly on the curriculum text above. Use the submit_questions tool to return your answer.`;
-}
-
-const questionTool = {
-  name: 'submit_questions',
-  description: 'Submit the generated exam questions',
-  input_schema: {
-    type: 'object',
-    properties: {
-      questions: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            type: { type: 'string', enum: ['true_false', 'multiple_choice'] },
-            text: { type: 'string' },
-            options: { type: 'array', items: { type: 'string' } },
-            correctAnswer: {},
-            explanation: { type: 'string' },
-          },
-          required: ['type', 'text', 'correctAnswer'],
-        },
-      },
-    },
-    required: ['questions'],
-  },
-};
-
-function validateQuestions(questions) {
-  if (!Array.isArray(questions) || questions.length === 0) {
-    throw new Error('No questions returned.');
-  }
-  for (const q of questions) {
-    if (q.type !== 'true_false' && q.type !== 'multiple_choice') {
-      throw new Error(`Invalid question type: ${q.type}`);
-    }
-    if (typeof q.text !== 'string' || q.text.trim().length === 0) {
-      throw new Error('Question text missing.');
-    }
-    if (q.type === 'true_false' && typeof q.correctAnswer !== 'boolean') {
-      throw new Error('true_false correctAnswer must be boolean.');
-    }
-    if (q.type === 'multiple_choice') {
-      if (!Array.isArray(q.options) || q.options.length < 3 || q.options.length > 5) {
-        throw new Error('multiple_choice needs 3-5 options.');
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
       }
-      if (
-        typeof q.correctAnswer !== 'number' ||
-        q.correctAnswer < 0 ||
-        q.correctAnswer >= q.options.length
-      ) {
-        throw new Error('multiple_choice correctAnswer must be a valid option index.');
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
       }
-    }
+
+      const examSnap = await tx.get(examRef);
+      const exam = examSnap.data() || {};
+      const showResult = exam.showResultToStudent !== false;
+
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return showResult
+          ? { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true }
+          : { hidden: true, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      const submittedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        tabSwitchCount,
+        status: 'submitted',
+        submittedAt,
+      });
+      tx.set(
+        db.collection('studentAttempts').doc(uid).collection('records').doc(attemptId),
+        {
+          examId,
+          examTitle: exam.title || '',
+          subject: exam.subject || '',
+          hidden: !showResult,
+          ...(showResult ? { score, totalPoints } : {}),
+          submittedAt,
+        }
+      );
+
+      return showResult
+        ? { score, totalPoints, alreadySubmitted: false }
+        : { hidden: true, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
   }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`generateQuestions service listening on port ${port}`);
+});
+    res.status(404).json({ error: 'This exam is not available.' });
+    return;
+  }
+  const exam = examSnap.data();
+
+  if (exam.restrictedStudentUid && exam.restrictedStudentUid !== uid) {
+    res.status(403).json({
+      error: 'This exam is restricted to a specific student.',
+      restricted: true,
+    });
+    return;
+  }
+
+  const now = Date.now();
+  if (exam.scheduledStartAt && now < exam.scheduledStartAt) {
+    res.status(403).json({
+      error: 'This exam has not started yet.',
+      notStarted: true,
+      scheduledStartAt: exam.scheduledStartAt,
+    });
+    return;
+  }
+  if (exam.scheduledEndAt && now > exam.scheduledEndAt) {
+    res.status(403).json({
+      error: 'This exam has ended.',
+      ended: true,
+    });
+    return;
+  }
+
+  const attemptsAllowed = (exam.settings && exam.settings.attemptsAllowed) || 1;
+  const priorAttempts = await examRef
+    .collection('attempts')
+    .where('studentUid', '==', uid)
+    .get();
+  if (priorAttempts.size >= attemptsAllowed) {
+    res.status(403).json({ error: 'You have no attempts left for this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  const questions = questionsSnap.docs.map((d) => {
+    const q = d.data();
+    return {
+      id: d.id,
+      type: q.type,
+      text: q.text,
+      options: q.options || null,
+      optionImageUrls: q.optionImageUrls || null,
+      points: q.points || 1,
+    };
+  });
+
+  // Shuffle question order per attempt so students sitting together see a
+  // different sequence — grading is keyed by question id, unaffected by order.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  let watermarkText = displayName;
+  const userSnap = await db.collection('users').doc(uid).get();
+  if (userSnap.exists && userSnap.data().nationalId) {
+    watermarkText = `${displayName} - ${userSnap.data().nationalId}`;
+  }
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    watermarkText,
+    questions,
+  });
+});
+
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  const tabSwitchCount = Math.max(0, Math.min(999, Number(req.body && req.body.tabSwitchCount) || 0));
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
+      }
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
+      }
+
+      const examSnap = await tx.get(examRef);
+      const exam = examSnap.data() || {};
+      const showResult = exam.showResultToStudent !== false;
+
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return showResult
+          ? { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true }
+          : { hidden: true, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      const submittedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        tabSwitchCount,
+        status: 'submitted',
+        submittedAt,
+      });
+      tx.set(
+        db.collection('studentAttempts').doc(uid).collection('records').doc(attemptId),
+        {
+          examId,
+          examTitle: exam.title || '',
+          subject: exam.subject || '',
+          hidden: !showResult,
+          ...(showResult ? { score, totalPoints } : {}),
+          submittedAt,
+        }
+      );
+
+      return showResult
+        ? { score, totalPoints, alreadySubmitted: false }
+        : { hidden: true, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`generateQuestions service listening on port ${port}`);
+});
+    res.status(404).json({ error: 'This exam is not available.' });
+    return;
+  }
+  const exam = examSnap.data();
+
+  if (exam.restrictedStudentUid && exam.restrictedStudentUid !== uid) {
+    res.status(403).json({
+      error: 'This exam is restricted to a specific student.',
+      restricted: true,
+    });
+    return;
+  }
+
+  const now = Date.now();
+  if (exam.scheduledStartAt && now < exam.scheduledStartAt) {
+    res.status(403).json({
+      error: 'This exam has not started yet.',
+      notStarted: true,
+      scheduledStartAt: exam.scheduledStartAt,
+    });
+    return;
+  }
+  if (exam.scheduledEndAt && now > exam.scheduledEndAt) {
+    res.status(403).json({
+      error: 'This exam has ended.',
+      ended: true,
+    });
+    return;
+  }
+
+  const attemptsAllowed = (exam.settings && exam.settings.attemptsAllowed) || 1;
+  const priorAttempts = await examRef
+    .collection('attempts')
+    .where('studentUid', '==', uid)
+    .get();
+  if (priorAttempts.size >= attemptsAllowed) {
+    res.status(403).json({ error: 'You have no attempts left for this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  const questions = questionsSnap.docs.map((d) => {
+    const q = d.data();
+    return {
+      id: d.id,
+      type: q.type,
+      text: q.text,
+      options: q.options || null,
+      optionImageUrls: q.optionImageUrls || null,
+      points: q.points || 1,
+    };
+  });
+
+  // Shuffle question order per attempt so students sitting together see a
+  // different sequence — grading is keyed by question id, unaffected by order.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  let watermarkText = displayName;
+  const userSnap = await db.collection('users').doc(uid).get();
+  if (userSnap.exists && userSnap.data().nationalId) {
+    watermarkText = `${displayName} - ${userSnap.data().nationalId}`;
+  }
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    watermarkText,
+    questions,
+  });
+});
+
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  const tabSwitchCount = Math.max(0, Math.min(999, Number(req.body && req.body.tabSwitchCount) || 0));
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
+      }
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
+      }
+
+      const examSnap = await tx.get(examRef);
+      const exam = examSnap.data() || {};
+      const showResult = exam.showResultToStudent !== false;
+
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return showResult
+          ? { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true }
+          : { hidden: true, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      const submittedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        tabSwitchCount,
+        status: 'submitted',
+        submittedAt,
+      });
+      tx.set(
+        db.collection('studentAttempts').doc(uid).collection('records').doc(attemptId),
+        {
+          examId,
+          examTitle: exam.title || '',
+          subject: exam.subject || '',
+          hidden: !showResult,
+          ...(showResult ? { score, totalPoints } : {}),
+          submittedAt,
+        }
+      );
+
+      return showResult
+        ? { score, totalPoints, alreadySubmitted: false }
+        : { hidden: true, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`generateQuestions service listening on port ${port}`);
+});
+    res.status(404).json({ error: 'This exam is not available.' });
+    return;
+  }
+  const exam = examSnap.data();
+
+  if (exam.restrictedStudentUid && exam.restrictedStudentUid !== uid) {
+    res.status(403).json({
+      error: 'This exam is restricted to a specific student.',
+      restricted: true,
+    });
+    return;
+  }
+
+  const now = Date.now();
+  if (exam.scheduledStartAt && now < exam.scheduledStartAt) {
+    res.status(403).json({
+      error: 'This exam has not started yet.',
+      notStarted: true,
+      scheduledStartAt: exam.scheduledStartAt,
+    });
+    return;
+  }
+  if (exam.scheduledEndAt && now > exam.scheduledEndAt) {
+    res.status(403).json({
+      error: 'This exam has ended.',
+      ended: true,
+    });
+    return;
+  }
+
+  const attemptsAllowed = (exam.settings && exam.settings.attemptsAllowed) || 1;
+  const priorAttempts = await examRef
+    .collection('attempts')
+    .where('studentUid', '==', uid)
+    .get();
+  if (priorAttempts.size >= attemptsAllowed) {
+    res.status(403).json({ error: 'You have no attempts left for this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  const questions = questionsSnap.docs.map((d) => {
+    const q = d.data();
+    return {
+      id: d.id,
+      type: q.type,
+      text: q.text,
+      options: q.options || null,
+      optionImageUrls: q.optionImageUrls || null,
+      points: q.points || 1,
+    };
+  });
+
+  // Shuffle question order per attempt so students sitting together see a
+  // different sequence — grading is keyed by question id, unaffected by order.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  let watermarkText = displayName;
+  const userSnap = await db.collection('users').doc(uid).get();
+  if (userSnap.exists && userSnap.data().nationalId) {
+    watermarkText = `${displayName} - ${userSnap.data().nationalId}`;
+  }
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    watermarkText,
+    questions,
+  });
+});
+
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  const tabSwitchCount = Math.max(0, Math.min(999, Number(req.body && req.body.tabSwitchCount) || 0));
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
+      }
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
+      }
+
+      const examSnap = await tx.get(examRef);
+      const exam = examSnap.data() || {};
+      const showResult = exam.showResultToStudent !== false;
+
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return showResult
+          ? { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true }
+          : { hidden: true, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      const submittedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        tabSwitchCount,
+        status: 'submitted',
+        submittedAt,
+      });
+      tx.set(
+        db.collection('studentAttempts').doc(uid).collection('records').doc(attemptId),
+        {
+          examId,
+          examTitle: exam.title || '',
+          subject: exam.subject || '',
+          hidden: !showResult,
+          ...(showResult ? { score, totalPoints } : {}),
+          submittedAt,
+        }
+      );
+
+      return showResult
+        ? { score, totalPoints, alreadySubmitted: false }
+        : { hidden: true, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`generateQuestions service listening on port ${port}`);
+});
+ };
+  });
+
+  // Shuffle question order per attempt so students sitting together see a
+  // different sequence — grading is keyed by question id, unaffected by order.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [questions[i], questions[j]] = [questions[j], questions[i]];
+  }
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  let watermarkText = displayName;
+  const userSnap = await db.collection('users').doc(uid).get();
+  if (userSnap.exists && userSnap.data().nationalId) {
+    watermarkText = `${displayName} - ${userSnap.data().nationalId}`;
+  }
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    watermarkText,
+    questions,
+  });
+});
+
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  const tabSwitchCount = Math.max(0, Math.min(999, Number(req.body && req.body.tabSwitchCount) || 0));
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
+      }
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
+      }
+
+      const examSnap = await tx.get(examRef);
+      const exam = examSnap.data() || {};
+      const showResult = exam.showResultToStudent !== false;
+
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return showResult
+          ? { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true }
+          : { hidden: true, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      const submittedAt = admin.firestore.FieldValue.serverTimestamp();
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        tabSwitchCount,
+        status: 'submitted',
+        submittedAt,
+      });
+      tx.set(
+        db.collection('studentAttempts').doc(uid).collection('records').doc(attemptId),
+        {
+          examId,
+          examTitle: exam.title || '',
+          subject: exam.subject || '',
+          hidden: !showResult,
+          ...(showResult ? { score, totalPoints } : {}),
+          submittedAt,
+        }
+      );
+
+      return showResult
+        ? { score, totalPoints, alreadySubmitted: false }
+        : { hidden: true, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`generateQuestions service listening on port ${port}`);
+});
